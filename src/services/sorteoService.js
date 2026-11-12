@@ -44,6 +44,47 @@ function verificarVentaPermitida(sorteo, tipoEsperado) {
   }
 }
 
+/**
+ * Registra el resultado oficial de un sorteo, lo valida según su tipo, marca el sorteo
+ * como JUGADO y liquida en memoria todos los tiquetes ACTIVOS de ese sorteo.
+ *
+ * Comportamiento y efectos que el código por sí solo no aclara:
+ * - Es destructiva y no repetible: si el sorteo ya está JUGADO responde 409, de modo que
+ *   el resultado oficial no puede sobrescribirse ni re-liquidar premios.
+ * - La liquidación es un efecto secundario inmediato (no hay tarea en segundo plano):
+ *   al terminar esta función cada tiquete ACTIVO del sorteo ya tiene su campo `premio`
+ *   calculado con `chanceService.calcularPremio` o `balotoService.calcularPremio`,
+ *   según el tipo del sorteo.
+ * - Los tiquetes ANULADOS y PAGADOS no se re-liquidan; conservan el estado que ya tenían.
+ * - El formato del `resultado` depende del tipo: para CHANCE debe ser una cadena de 4
+ *   dígitos (ver `chanceService.validarResultado`) y para BALOTO un objeto con 5 números
+ *   (1-43, sin repetir) y superbalota (1-16) (ver `balotoService.validarJugada`). El
+ *   resultado se almacena normalizado (jugada ordenada de menor a mayor).
+ * - Además del `resultado`, el sorteo recibe la marca de tiempo `jugadoEn`, que luego
+ *   gobierna la caducidad del premio en `ticketService.pagarPremio`.
+ *
+ * @function registrarResultado
+ * @param {number|string} id - Identificador del sorteo; se compara como número
+ *   (`Number(id)`) porque así llega desde la ruta `POST /api/v1/sorteos/:id/resultado`.
+ * @param {string|{numeros: number[], superbalota: number}} resultado - Resultado oficial:
+ *   cadena de 4 dígitos para CHANCE (p. ej. `"1234"`) u objeto jugada para BALOTO
+ *   (p. ej. `{numeros: [3, 10, 21, 30, 43], superbalota: 7}`).
+ * @returns {{id: number, tipo: 'CHANCE'|'BALOTO', nombre: string, fecha: string,
+ *   estado: 'JUGADO', resultado: (string|{numeros: number[], superbalota: number}),
+ *   acumulado: number, jugadoEn: string}}
+ *   El sorteo actualizado, con `estado: 'JUGADO'`, el resultado validado/normalizado y
+ *   `jugadoEn` en ISO 8601 UTC. Es la misma referencia del objeto en memoria, por lo que
+ *   las liquidaciones ya son visibles para consultas posteriores.
+ * @throws {AppError} Con status 404 si no existe un sorteo con ese id
+ *   (`'Sorteo no encontrado'`, reenviado por `obtener`).
+ * @throws {AppError} Con status 409 si el sorteo ya tiene resultado
+ *   (`'El sorteo ya tiene resultado'`).
+ * @throws {AppError} Con status 400 si `resultado` no cumple el formato exigido por el
+ *   tipo del sorteo (propagado por `validarResultado` o `validarJugada`).
+ * @example
+ * // Resultado de chance desde el controlador (rol ADMIN):
+ * res.json(sorteoService.registrarResultado(req.params.id, req.body.resultado));
+ */
 function registrarResultado(id, resultado) {
   const sorteo = obtener(id);
   if (sorteo.estado === 'JUGADO') throw new AppError('El sorteo ya tiene resultado', 409);

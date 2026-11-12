@@ -1,0 +1,1173 @@
+openapi: 3.0.3
+info:
+  title: Puesto de Chance API
+  version: 1.0.0
+  description: |
+    API REST para la gestión de un puesto de chance (juegos legalizados en Colombia):
+    autenticación de usuarios con JWT, administración de sorteos de tipo CHANCE y BALOTO,
+    venta de tiquetes, consulta, anulación y pago de premios, además del resumen y cierre
+    diario de caja.
+
+    ## Cómo autenticarse
+    1. Haga `POST /api/v1/auth/login` con un usuario del semillero de datos
+       (`vendedor1`/`vende123`, `vendedor2`/`vende456`, `admin`/`admin123`).
+    2. Copie el `token` de la respuesta.
+    3. Haga clic en el botón **Authorize** de esta página, pegue el token y use
+       `Bearer` como esquema. Swagger UI lo incluirá en cada petición.
+
+    ## Reglas del negocio
+    - Solo los usuarios con rol `VENDEDOR` venden tiquetes y cierran caja; `ADMIN`
+      administra sorteos y registra resultados.
+    - Las ventas de un sorteo cierran `MINUTOS_CIERRE_VENTAS` minutos antes de su fecha.
+    - Un tiquete se puede anular dentro de los `MINUTOS_ANULACION` minutos siguientes a la
+      venta y solo por el vendedor que lo emitió (el `ADMIN` no tiene límite de tiempo).
+    - Los premios se pagan solo después de que el sorteo se marque `JUGADO` y caducan
+      `DIAS_CADUCIDAD_PREMIO` días después de jugado.
+    - Los datos viven en memoria; cada reinicio de la aplicación restaura el semillero.
+  contact:
+    name: Equipo ADSO SENA - proyecto documentacionApi
+    url: https://github.com/crgonzalez3212/documentacionApi
+servers:
+  - url: http://localhost:3000
+    description: Servidor local (el puerto se cambia con la variable de entorno PORT)
+tags:
+  - name: Salud
+    description: Comprobación de disponibilidad del servidor.
+  - name: Autenticación
+    description: Emisión y consulta del usuario autenticado con JWT.
+  - name: Sorteos
+    description: Consulta, creación y registro de resultados de sorteos.
+  - name: Tiquetes
+    description: Venta, consulta, anulación y pago de premios de tiquetes.
+  - name: Caja
+    description: Resumen diario de ventas y cierre de caja por vendedor.
+paths:
+  /health:
+    get:
+      tags: [Salud]
+      summary: Verifica que el servidor esté activo
+      operationId: verificarSalud
+      security: []
+      responses:
+        '200':
+          description: El servidor está en línea.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Salud'
+              example:
+                estado: ok
+                hora: '2026-11-12T15:04:05.000Z'
+  /api/v1/auth/login:
+    post:
+      tags: [Autenticación]
+      summary: Emite un token JWT con las credenciales del usuario
+      operationId: iniciarSesion
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            examples:
+              vendedor:
+                summary: Vendedor del semillero de datos
+                value:
+                  usuario: vendedor1
+                  password: vende123
+              administrador:
+                summary: Administrador del semillero de datos
+                value:
+                  usuario: admin
+                  password: admin123
+      responses:
+        '200':
+          description: Autenticación exitosa.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '400':
+          description: Falta el usuario o la contraseña en el cuerpo.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Usuario y contraseña son obligatorios
+        '401':
+          description: El usuario no existe o la contraseña no coincide.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Credenciales inválidas
+        '403':
+          description: El usuario existe pero está desactivado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Usuario inactivo
+  /api/v1/auth/perfil:
+    get:
+      tags: [Autenticación]
+      summary: Devuelve el perfil del usuario autenticado
+      operationId: verPerfil
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Perfil del usuario (sin hash de contraseña).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PerfilUsuario'
+              example:
+                id: 2
+                usuario: vendedor1
+                nombre: Ana Pérez
+                rol: VENDEDOR
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+  /api/v1/sorteos:
+    get:
+      tags: [Sorteos]
+      summary: Lista los sorteos, con filtros opcionales
+      operationId: listarSorteos
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: tipo
+          in: query
+          required: false
+          description: Filtra por tipo de juego.
+          schema:
+            $ref: '#/components/schemas/TipoSorteo'
+        - name: estado
+          in: query
+          required: false
+          description: Filtra por estado del sorteo.
+          schema:
+            $ref: '#/components/schemas/EstadoSorteo'
+      responses:
+        '200':
+          description: Lista (posiblemente vacía) de sorteos que cumplen los filtros.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Sorteo'
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+    post:
+      tags: [Sorteos]
+      summary: Crea un sorteo (solo ADMIN)
+      operationId: crearSorteo
+      description: >-
+        Requiere rol `ADMIN`. La fecha debe ser futura: la API rechaza sorteos cuya fecha
+        ya pasó. Para BALOTO se puede enviar un `acumulado` inicial; en CHANCE el
+        acumulado siempre se guarda en 0.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SorteoEntrada'
+            example:
+              tipo: CHANCE
+              nombre: Lotería del Valle
+              fecha: '2026-11-13T21:30:00.000Z'
+      responses:
+        '201':
+          description: Sorteo creado con estado inicial ABIERTO.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sorteo'
+        '400':
+          description: Tipo inválido, nombre ausente o fecha inválida/pasada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                tipoInvalido:
+                  value:
+                    error: Tipo de sorteo inválido
+                fechaPasada:
+                  value:
+                    error: La fecha del sorteo debe ser futura
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+        '403':
+          $ref: '#/components/responses/SinPermisos'
+  /api/v1/sorteos/{id}:
+    get:
+      tags: [Sorteos]
+      summary: Consulta un sorteo por su identificador
+      operationId: obtenerSorteo
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdSorteo'
+      responses:
+        '200':
+          description: Datos del sorteo.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sorteo'
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+        '404':
+          description: No existe un sorteo con ese identificador.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Sorteo no encontrado
+  /api/v1/sorteos/{id}/resultado:
+    post:
+      tags: [Sorteos]
+      summary: Registra el resultado y liquida los tiquetes (solo ADMIN)
+      operationId: registrarResultado
+      description: >-
+        Requiere rol `ADMIN`. El formato del `resultado` depende del tipo del sorteo:
+        para CHANCE es una cadena de 4 dígitos (las cuatro cifras del "número ganador")
+        y para BALOTO es un objeto con 5 números (1 a 43, sin repetir) y una superbalota
+        (1 a 16). Al registrarlo el sorteo pasa a `JUGADO` y todos los tiquetes ACTIVOS
+        del sorteo quedan liquidados con su premio calculado. No se puede repetir: si el
+        sorteo ya está `JUGADO` responde 409.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdSorteo'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResultadoEntrada'
+            examples:
+              chance:
+                summary: Resultado de un sorteo CHANCE
+                value:
+                  resultado: '1234'
+              baloto:
+                summary: Resultado de un sorteo BALOTO
+                value:
+                  resultado:
+                    numeros: [3, 10, 21, 30, 43]
+                    superbalota: 7
+      responses:
+        '200':
+          description: Resultado registrado y tiquetes liquidados.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sorteo'
+        '400':
+          description: El resultado no cumple el formato del tipo del sorteo.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: El resultado de chance debe ser un número de 4 dígitos
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+        '403':
+          $ref: '#/components/responses/SinPermisos'
+        '404':
+          description: Sorteo no encontrado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: El sorteo ya tiene resultado (estado JUGADO).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: El sorteo ya tiene resultado
+  /api/v1/tickets/chance:
+    post:
+      tags: [Tiquetes]
+      summary: Vende un tiquete de chance (solo VENDEDOR)
+      operationId: venderChance
+      description: >-
+        Requiere rol `VENDEDOR`. Crea un tiquete con entre 1 y 5 apuestas sobre un sorteo
+        CHANCE que esté ABIERTO y con ventas vigentes. Cada apuesta se valida: número de
+        1 a 4 dígitos, valor entero entre `APUESTA_MIN_CHANCE` y `APUESTA_MAX_CHANCE`
+        (por defecto 500 a 50 000) y múltiplo de 100. La modalidad por omisión es
+        DIRECTO; COMBINADO solo admite 3 o 4 cifras y no números con todas las cifras
+        iguales. El código del tiquete se genera con el prefijo `CH-` y 8 caracteres
+        hexadecimales aleatorios.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VentaChanceEntrada'
+            example:
+              sorteoId: 1
+              cliente: 'CC 1017234567'
+              apuestas:
+                - numero: '1234'
+                  modalidad: DIRECTO
+                  valor: 2000
+                - numero: '56'
+                  valor: 1000
+      responses:
+        '201':
+          description: Tiquete emitido en estado ACTIVO con el total a cobrar.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TiqueteChance'
+        '400':
+          description: Apuestas ausentes, fuera del rango 1-5 o con datos inválidos.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                cantidad:
+                  value:
+                    error: Un tiquete de chance debe tener entre 1 y 5 apuestas
+                valor:
+                  value:
+                    error: El valor debe estar entre 500 y 50000
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+        '403':
+          $ref: '#/components/responses/SinPermisos'
+        '404':
+          description: El sorteo indicado no existe.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Sorteo no encontrado
+        '409':
+          description: El sorteo no está abierto o las ventas ya cerraron.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                cerrado:
+                  value:
+                    error: El sorteo no está abierto para ventas
+                fueraDeTiempo:
+                  value:
+                    error: Las ventas para este sorteo ya cerraron
+  /api/v1/tickets/baloto:
+    post:
+      tags: [Tiquetes]
+      summary: Vende un tiquete de Baloto (solo VENDEDOR)
+      operationId: venderBaloto
+      description: >-
+        Requiere rol `VENDEDOR`. Crea un tiquete con entre 1 y 10 jugadas sobre un sorteo
+        BALOTO ABIERTO. Cada jugada se valida o se genera aleatoria con `aleatoria: true`.
+        El total se calcula como `jugadas × VALOR_BALOTO` (5 700 por defecto). El código
+        se genera con el prefijo `BL-`.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VentaBalotoEntrada'
+            example:
+              sorteoId: 3
+              cliente: 'CC 79145632'
+              jugadas:
+                - numeros: [1, 2, 3, 4, 5]
+                  superbalota: 6
+                - aleatoria: true
+      responses:
+        '201':
+          description: Tiquete emitido en estado ACTIVO con el total a cobrar.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TiqueteBaloto'
+        '400':
+          description: Jugadas ausentes, más de 10, o números/superbalota inválidos.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                cantidad:
+                  value:
+                    error: Un tiquete de Baloto debe tener entre 1 y 10 jugadas
+                repetidos:
+                  value:
+                    error: Los números de una jugada no se pueden repetir
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+        '403':
+          $ref: '#/components/responses/SinPermisos'
+        '404':
+          description: El sorteo indicado no existe.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: El sorteo no está abierto o las ventas ya cerraron.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /api/v1/tickets:
+    get:
+      tags: [Tiquetes]
+      summary: Lista los tiquetes visibles para el usuario autenticado
+      operationId: listarTiquetes
+      description: >-
+        Los vendedores solo ven sus propios tiquetes; el ADMIN ve todos. Se puede filtrar
+        por `estado` (ACTIVO, ANULADO, PAGADO, CADUCADO) y por `fecha` con formato
+        `YYYY-MM-DD` (se compara contra el inicio del `creadoEn` del tiquete).
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: fecha
+          in: query
+          required: false
+          description: Fecha de venta en formato `YYYY-MM-DD` (zona ZONA_HORARIA).
+          schema:
+            type: string
+            format: date
+            example: '2026-11-12'
+        - name: estado
+          in: query
+          required: false
+          description: Estado del tiquete.
+          schema:
+            $ref: '#/components/schemas/EstadoTiquete'
+      responses:
+        '200':
+          description: Lista de tiquetes (posiblemente vacía).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Tiquete'
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+  /api/v1/tickets/{codigo}:
+    get:
+      tags: [Tiquetes]
+      summary: Consulta un tiquete por su código
+      operationId: consultarTiquete
+      description: >-
+        Devuelve el tiquete, un resumen del sorteo asociado y el campo `ganador`: `true`
+        o `false` si el sorteo ya se jugó, o `null` si todavía no tiene resultado.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/CodigoTiquete'
+      responses:
+        '200':
+          description: Tiquete con el resumen del sorteo y el indicador de ganador.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsultaTiquete'
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+        '404':
+          description: No existe un tiquete con ese código.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Tiquete no encontrado
+  /api/v1/tickets/{codigo}/anular:
+    post:
+      tags: [Tiquetes]
+      summary: Anula un tiquete activo
+      operationId: anularTiquete
+      description: >-
+        Anula un tiquete ACTIVO cuyo sorteo aún no se ha jugado. Solo el vendedor que lo
+        emitió o el ADMIN pueden hacerlo; el vendedor además debe hacerlo dentro de los
+        `MINUTOS_ANULACION` minutos (10 por defecto) siguientes a la venta y siempre debe
+        indicar el motivo. La anulación queda registrada con usuario, motivo y fecha.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/CodigoTiquete'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AnulacionEntrada'
+            example:
+              motivo: Cliente cambió el número
+      responses:
+        '200':
+          description: Tiquete anulado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Tiquete'
+        '400':
+          description: Motivo ausente.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Debe indicar el motivo de anulación
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+        '403':
+          description: El tiquete pertenece a otro vendedor.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: No puede anular tiquetes de otro vendedor
+        '404':
+          description: Tiquete no encontrado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Estado incompatible (ya anulado/pagado) o fuera de tiempo.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                fueraDeTiempo:
+                  value:
+                    error: Solo se puede anular dentro de los 10 minutos siguientes a la venta
+                sorteoJugado:
+                  value:
+                    error: No se puede anular un tiquete de un sorteo jugado
+  /api/v1/tickets/{codigo}/pagar:
+    post:
+      tags: [Tiquetes]
+      summary: Paga el premio de un tiquete ganador (solo VENDEDOR)
+      operationId: pagarPremio
+      description: >-
+        Requiere rol `VENDEDOR`. Solo aplica cuando el sorteo está `JUGADO`, el tiquete
+        está ACTIVO y tiene premio mayor a 0. El pago se registra con su valor y fecha y
+        el tiquete pasa a `PAGADO`; no se puede pagar dos veces (409). Si el premio ya
+        caducó (`DIAS_CADUCIDAD_PREMIO` días desde el jugado), el tiquete pasa a
+        `CADUCADO` y responde 410.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/CodigoTiquete'
+      responses:
+        '200':
+          description: Pago registrado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Pago'
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+        '403':
+          $ref: '#/components/responses/SinPermisos'
+        '404':
+          description: Tiquete no encontrado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Sorteo sin jugar, tiquete en estado incompatible, sin premio o premio ya pagado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                sinJugar:
+                  value:
+                    error: El sorteo aún no se ha jugado
+                yaPagado:
+                  value:
+                    error: El premio ya fue pagado
+                sinPremio:
+                  value:
+                    error: El tiquete no tiene premio
+        '410':
+          description: El premio caducó; el tiquete queda marcado CADUCADO.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: El premio está caducado
+  /api/v1/caja/resumen:
+    get:
+      tags: [Caja]
+      summary: Resumen diario de ventas y premios
+      operationId: resumenCaja
+      description: >-
+        Devuelve el resumen de la caja de un vendedor para una fecha (por omisión, hoy en
+        la zona `ZONA_HORARIA`). Un VENDEDOR siempre consulta su propia caja; un ADMIN
+        puede consultar la de cualquier vendedor enviando `vendedorId`.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: fecha
+          in: query
+          required: false
+          description: Fecha a consultar en formato `YYYY-MM-DD`.
+          schema:
+            type: string
+            format: date
+            example: '2026-11-12'
+        - name: vendedorId
+          in: query
+          required: false
+          description: Identificador del vendedor (solo lo usa el rol ADMIN).
+          schema:
+            type: integer
+            example: 2
+      responses:
+        '200':
+          description: Resumen consolidado del día.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResumenCaja'
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+  /api/v1/caja/cierre:
+    post:
+      tags: [Caja]
+      summary: Cierra la caja del día (solo VENDEDOR)
+      operationId: cerrarCaja
+      description: >-
+        Requiere rol `VENDEDOR`. Compara el efectivo reportado con el saldo esperado del
+        día (`totalVendido - totalPagado`) y clasifica el cierre como CUADRADA (diferencia
+        0), SOBRANTE (positiva) o FALTANTE (negativa). La caja de un día solo se cierra
+        una vez; un segundo intento responde 409.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CierreCajaEntrada'
+            example:
+              efectivoReportado: 10700
+      responses:
+        '201':
+          description: Cierre registrado con su estado y diferencia.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CierreCaja'
+        '400':
+          description: El efectivo reportado no es un entero positivo.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: El efectivo reportado debe ser un entero positivo
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+        '403':
+          $ref: '#/components/responses/SinPermisos'
+        '409':
+          description: La caja de ese día ya fue cerrada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: La caja de ese día ya fue cerrada
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Token JWT emitido por `POST /api/v1/auth/login`.
+  parameters:
+    IdSorteo:
+      name: id
+      in: path
+      required: true
+      description: Identificador numérico del sorteo.
+      schema:
+        type: integer
+        example: 1
+    CodigoTiquete:
+      name: codigo
+      in: path
+      required: true
+      description: Código del tiquete impreso en el ticket (`CH-…` para chance, `BL-…` para Baloto).
+      schema:
+        type: string
+        pattern: '^(CH|BL)-[0-9A-F]{8}$'
+        example: CH-A1B2C3D4
+  responses:
+    NoAutenticado:
+      description: Falta el encabezado Authorization o el token es inválido o expiró.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            sinToken:
+              value:
+                error: Token requerido
+            tokenInvalido:
+              value:
+                error: Token inválido o expirado
+    SinPermisos:
+      description: El usuario autenticado no tiene el rol requerido para la operación.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: No tiene permisos para esta acción
+  schemas:
+    Salud:
+      type: object
+      properties:
+        estado:
+          type: string
+          example: ok
+        hora:
+          type: string
+          format: date-time
+          description: Hora del servidor en formato ISO 8601 UTC.
+    LoginRequest:
+      type: object
+      required: [usuario, password]
+      properties:
+        usuario:
+          type: string
+          description: Nombre de usuario del semillero de datos.
+          example: vendedor1
+        password:
+          type: string
+          format: password
+          description: Contraseña en texto plano; se compara contra el hash bcrypt almacenado.
+          example: vende123
+    PerfilUsuario:
+      type: object
+      properties:
+        id:
+          type: integer
+          example: 2
+        usuario:
+          type: string
+          example: vendedor1
+        nombre:
+          type: string
+          example: Ana Pérez
+        rol:
+          type: string
+          enum: [ADMIN, VENDEDOR]
+          example: VENDEDOR
+    LoginResponse:
+      type: object
+      properties:
+        token:
+          type: string
+          description: JWT firmado con JWT_SECRET; vence en JWT_EXPIRES_IN (8 h por defecto).
+          example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6Miwi...
+        usuario:
+          $ref: '#/components/schemas/PerfilUsuario'
+    TipoSorteo:
+      type: string
+      enum: [CHANCE, BALOTO]
+    EstadoSorteo:
+      type: string
+      enum: [ABIERTO, JUGADO]
+    EstadoTiquete:
+      type: string
+      enum: [ACTIVO, ANULADO, PAGADO, CADUCADO]
+    Sorteo:
+      type: object
+      properties:
+        id:
+          type: integer
+          example: 1
+        tipo:
+          $ref: '#/components/schemas/TipoSorteo'
+        nombre:
+          type: string
+          example: Lotería de Bogotá
+        fecha:
+          type: string
+          format: date-time
+          description: Fecha y hora del sorteo en ISO 8601 UTC.
+          example: '2026-11-13T15:04:05.000Z'
+        estado:
+          $ref: '#/components/schemas/EstadoSorteo'
+        resultado:
+          description: >-
+            null hasta que el sorteo se juega; para CHANCE es la cadena de 4 dígitos
+            ganadora y para BALOTO la jugada ganadora.
+          oneOf:
+            - type: string
+            - $ref: '#/components/schemas/JugadaBaloto'
+          nullable: true
+        acumulado:
+          type: integer
+          description: Pozo acumulado del sorteo (solo se usa en BALOTO).
+          example: 4500000000
+    SorteoEntrada:
+      type: object
+      required: [tipo, nombre, fecha]
+      properties:
+        tipo:
+          $ref: '#/components/schemas/TipoSorteo'
+        nombre:
+          type: string
+          example: Lotería del Valle
+        fecha:
+          type: string
+          format: date-time
+          description: Fecha futura del sorteo; una fecha pasada o inválida se rechaza con 400.
+          example: '2026-11-13T21:30:00.000Z'
+        acumulado:
+          type: integer
+          description: Pozo inicial (solo se respeta para BALOTO).
+          example: 1000000000
+    JugadaBaloto:
+      type: object
+      required: [numeros, superbalota]
+      properties:
+        numeros:
+          type: array
+          description: Cinco números distintos entre 1 y 43, ordenados de menor a mayor.
+          items:
+            type: integer
+            minimum: 1
+            maximum: 43
+          minItems: 5
+          maxItems: 5
+          example: [3, 10, 21, 30, 43]
+        superbalota:
+          type: integer
+          minimum: 1
+          maximum: 16
+          example: 7
+    JugadaEntrada:
+      description: >-
+        Jugada manual con `numeros` y `superbalota`, o jugada generada aleatoriamente
+        cuando se envía `aleatoria: true`.
+      oneOf:
+        - $ref: '#/components/schemas/JugadaBaloto'
+        - type: object
+          properties:
+            aleatoria:
+              type: boolean
+              example: true
+    ResultadoEntrada:
+      type: object
+      required: [resultado]
+      properties:
+        resultado:
+          description: >-
+            Cadena de 4 dígitos para CHANCE u objeto jugada para BALOTO, según el tipo
+            del sorteo referenciado.
+          oneOf:
+            - type: string
+              pattern: '^\d{4}$'
+              example: '1234'
+            - $ref: '#/components/schemas/JugadaBaloto'
+    ApuestaChance:
+      type: object
+      required: [numero, valor]
+      properties:
+        numero:
+          type: string
+          pattern: '^\d{1,4}$'
+          description: Número apostado de 1 a 4 dígitos (se envía como cadena).
+          example: '1234'
+        cifras:
+          type: integer
+          description: Longitud del número (la API la calcula; 4 por omisión en ejemplos).
+          example: 4
+        modalidad:
+          type: string
+          enum: [DIRECTO, COMBINADO]
+          default: DIRECTO
+          description: >-
+            DIRECTO paga si coincide el número completo; COMBINADO divide el premio entre
+            las permutaciones del número y solo aplica a 3 o 4 cifras.
+        valor:
+          type: integer
+          description: Valor en pesos; entero entre APUESTA_MIN_CHANCE y APUESTA_MAX_CHANCE y múltiplo de 100.
+          example: 2000
+    VentaChanceEntrada:
+      type: object
+      required: [sorteoId, apuestas]
+      properties:
+        sorteoId:
+          type: integer
+          description: Identificador del sorteo CHANCE al que se apuesta.
+          example: 1
+        apuestas:
+          type: array
+          minItems: 1
+          maxItems: 5
+          description: Entre 1 y 5 apuestas por tiquete.
+          items:
+            $ref: '#/components/schemas/ApuestaChance'
+        cliente:
+          type: string
+          nullable: true
+          description: Identificación o nombre del cliente (opcional, se registra tal cual).
+          example: 'CC 1017234567'
+    VentaBalotoEntrada:
+      type: object
+      required: [sorteoId, jugadas]
+      properties:
+        sorteoId:
+          type: integer
+          description: Identificador del sorteo BALOTO.
+          example: 3
+        jugadas:
+          type: array
+          minItems: 1
+          maxItems: 10
+          description: Entre 1 y 10 jugadas por tiquete.
+          items:
+            $ref: '#/components/schemas/JugadaEntrada'
+        cliente:
+          type: string
+          nullable: true
+          example: 'CC 79145632'
+    Tiquete:
+      type: object
+      properties:
+        id:
+          type: integer
+          example: 1
+        codigo:
+          type: string
+          example: CH-A1B2C3D4
+        tipo:
+          $ref: '#/components/schemas/TipoSorteo'
+        sorteoId:
+          type: integer
+          example: 1
+        vendedorId:
+          type: integer
+          example: 2
+        cliente:
+          type: string
+          nullable: true
+          example: 'CC 1017234567'
+        total:
+          type: integer
+          description: Suma de los valores de las apuestas o jugadas.
+          example: 3000
+        estado:
+          $ref: '#/components/schemas/EstadoTiquete'
+        premio:
+          type: integer
+          nullable: true
+          description: null hasta que el sorteo se juegue; luego el valor liquidado.
+          example: 4500000
+        creadoEn:
+          type: string
+          format: date-time
+          example: '2026-11-12T15:04:05.000Z'
+    TiqueteChance:
+      allOf:
+        - $ref: '#/components/schemas/Tiquete'
+        - type: object
+          properties:
+            apuestas:
+              type: array
+              description: Apuestas validadas y normalizadas del tiquete.
+              items:
+                $ref: '#/components/schemas/ApuestaChance'
+    TiqueteBaloto:
+      allOf:
+        - $ref: '#/components/schemas/Tiquete'
+        - type: object
+          properties:
+            jugadas:
+              type: array
+              description: Jugadas validadas o generadas aleatoriamente.
+              items:
+                $ref: '#/components/schemas/JugadaBaloto'
+    ConsultaTiquete:
+      allOf:
+        - $ref: '#/components/schemas/Tiquete'
+        - type: object
+          properties:
+            sorteo:
+              type: object
+              properties:
+                id:
+                  type: integer
+                  example: 1
+                nombre:
+                  type: string
+                  example: Lotería de Bogotá
+                fecha:
+                  type: string
+                  format: date-time
+                estado:
+                  $ref: '#/components/schemas/EstadoSorteo'
+                resultado:
+                  nullable: true
+                  oneOf:
+                    - type: string
+                    - $ref: '#/components/schemas/JugadaBaloto'
+            ganador:
+              type: boolean
+              nullable: true
+              description: >-
+                true o false cuando el sorteo ya se jugó (premio mayor a 0); null si
+                aún no tiene resultado.
+              example: true
+    AnulacionEntrada:
+      type: object
+      required: [motivo]
+      properties:
+        motivo:
+          type: string
+          description: Justificación de la anulación; se guarda en el registro del tiquete.
+          example: Cliente cambió el número
+    Pago:
+      type: object
+      properties:
+        id:
+          type: integer
+          example: 1
+        ticketId:
+          type: integer
+          example: 1
+        codigo:
+          type: string
+          example: CH-A1B2C3D4
+        usuarioId:
+          type: integer
+          description: Vendedor que pagó el premio.
+          example: 2
+        valor:
+          type: integer
+          description: Valor del premio liquidado.
+          example: 4500000
+        fecha:
+          type: string
+          format: date-time
+          example: '2026-11-12T16:00:00.000Z'
+    ResumenCaja:
+      type: object
+      properties:
+        vendedorId:
+          type: integer
+          example: 2
+        fecha:
+          type: string
+          format: date
+          description: Fecha del resumen en formato YYYY-MM-DD (zona ZONA_HORARIA).
+          example: '2026-11-12'
+        tiquetesVendidos:
+          type: integer
+          description: Tiquetes válidos del día (excluye anulados).
+          example: 2
+        tiquetesAnulados:
+          type: integer
+          example: 0
+        ventasChance:
+          type: integer
+          description: Total vendido en chance.
+          example: 5000
+        ventasBaloto:
+          type: integer
+          description: Total vendido en Baloto.
+          example: 5700
+        totalVendido:
+          type: integer
+          example: 10700
+        premiosPagados:
+          type: integer
+          description: Cantidad de pagos registrados por el vendedor en el día.
+          example: 0
+        totalPagado:
+          type: integer
+          example: 0
+        saldoEsperado:
+          type: integer
+          description: totalVendido menos totalPagado; es el efectivo que debería haber en caja.
+          example: 10700
+        cerrada:
+          type: boolean
+          description: true si la caja de ese vendedor y fecha ya tiene un cierre.
+          example: false
+    CierreCajaEntrada:
+      type: object
+      required: [efectivoReportado]
+      properties:
+        efectivoReportado:
+          type: integer
+          minimum: 0
+          description: Dinero contado en caja; entero mayor o igual a 0.
+          example: 10700
+        fecha:
+          type: string
+          format: date
+          description: Fecha del cierre (por omisión, hoy en la zona ZONA_HORARIA).
+          example: '2026-11-12'
+    CierreCaja:
+      allOf:
+        - $ref: '#/components/schemas/ResumenCaja'
+        - type: object
+          properties:
+            efectivoReportado:
+              type: integer
+              example: 10000
+            diferencia:
+              type: integer
+              description: efectivoReportado menos saldoEsperado.
+              example: -700
+            estado:
+              type: string
+              enum: [CUADRADA, SOBRANTE, FALTANTE]
+              description: CUADRADA si la diferencia es 0, SOBRANTE si es positiva y FALTANTE si es negativa.
+              example: FALTANTE
+            creadoEn:
+              type: string
+              format: date-time
+              example: '2026-11-12T21:00:00.000Z'
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          description: Mensaje del error en español; los errores 500 se enmascaran como "Error interno del servidor".
+      required: [error]

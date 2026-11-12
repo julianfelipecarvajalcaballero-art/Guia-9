@@ -1,0 +1,24 @@
+# Dependencias
+node_modules/
+
+# Variables de entorno con valores reales (las credenciales NO se publican)
+.env
+.env.local
+.env.*.local
+
+# Archivos de ejemplo SÍ se versionan
+!.env.example
+
+# Registros y temporales de npm
+npm-debug.log*
+yarn-error.log*
+
+# Cobertura de pruebas
+coverage/
+.nyc_output/
+
+# Editores y sistema operativo
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
